@@ -44,11 +44,10 @@ static void lcd_delay(uint64_t ms) {
   }
 }
 
-static esp_err_t lcd_i2c_write(const struct Lcd* lcd, uint8_t value) {
-  if (lcd->state & LCD_STATE_BACKLIGHT_ON) {
-    value |= 0x08;
-  }
+#define BACKLIGHT 0x08
 
+static esp_err_t lcd_i2c_write(const struct Lcd* lcd, uint8_t value) {
+  value |= BACKLIGHT;
   return i2c_master_transmit(lcd->dev_handle, &value, 1, TIMEOUT);
 }
 
@@ -155,9 +154,10 @@ void lcd_deinit(struct Lcd* lcd) {
 }
 
 #define ENTRY_MODE_SET 0x04
+#define DISPLAY_CONTROL 0x08
 #define FUNCTION_SET 0x20
 
-esp_err_t lcd_reset(struct Lcd* lcd, uint8_t lcd_state) {
+esp_err_t lcd_reset(const struct Lcd* lcd) {
   // See datascheet on page 16.
   lcd_delay(50);
 
@@ -187,7 +187,9 @@ esp_err_t lcd_reset(struct Lcd* lcd, uint8_t lcd_state) {
     return ret;
   }
 
-  if ((ret = lcd_toggle_state(lcd, lcd_state)) != ESP_OK) {
+  // Turn on the display.
+  if ((ret = lcd_write(lcd, DISPLAY_CONTROL | 0x04, LCD_MODE_COMMAND)) !=
+      ESP_OK) {
     return ret;
   }
 
@@ -227,15 +229,6 @@ esp_err_t lcd_return_home(const struct Lcd* lcd) {
 esp_err_t lcd_set_cursor(const struct Lcd* lcd, enum LcdRow row, uint8_t col) {
   return lcd_write(lcd, SET_DISPLAY_DATA_RAM_ACCESS | (col + row),
                    LCD_MODE_COMMAND);
-}
-
-#define DISPLAY_CONTROL 0x08
-
-esp_err_t lcd_toggle_state(struct Lcd* lcd, uint8_t lcd_state) {
-  lcd->state = lcd_state;
-  return lcd_write(
-      lcd, DISPLAY_CONTROL | (lcd_state & LCD_STATE_DISPLAY_ON) ? 0x04 : 0x00,
-      LCD_MODE_COMMAND);
 }
 
 esp_err_t lcd_write_data(const struct Lcd* lcd, uint8_t value) {
