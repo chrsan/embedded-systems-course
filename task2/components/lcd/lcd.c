@@ -1,6 +1,5 @@
 #include "lcd.h"
 
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -10,12 +9,11 @@
 #include "esp_timer.h"
 
 #define TAG "lcd"
-#define TIMEOUT 50
+#define TIMEOUT 1000
 
 struct Lcd {
   i2c_master_bus_handle_t bus_handle;
   i2c_master_dev_handle_t dev_handle;
-  uint8_t state;
 };
 
 // N.B. The vTaskDelay does not seem to work for short delays.
@@ -135,7 +133,7 @@ err:
     i2c_del_master_bus(l->bus_handle);
   }
 
-  free(l);
+  lcd_deinit(l);
   return ret;
 }
 
