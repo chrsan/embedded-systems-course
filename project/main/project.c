@@ -20,13 +20,15 @@
 #define LCD1602_I2C_PORT I2C_NUM_0
 #define LCD1602_SDA_PIN GPIO_NUM_13
 #define LCD1602_SCL_PIN GPIO_NUM_14
-#define LCD1602_TOGGLE_BACKLIGHT_BUTTON_PIN GPIO_NUM_15
+#define LCD1602_TOGGLE_BACKLIGHT_BUTTON_PIN GPIO_NUM_32
 #define LCD1602_TOGGLE_PAGE_BUTTON_PIN GPIO_NUM_33
 
 #define LCD1602_BUFFER_SIZE 16
 
-#define DHT11_PIN GPIO_NUM_2
+#define DHT11_PIN GPIO_NUM_4
 #define DHT11_SENSOR_READ_INTERVAL_MS 4000
+
+#define LED_PIN GPIO_NUM_15
 
 #define QUEUE_LENGTH 8
 
@@ -68,10 +70,7 @@ struct MeasurementState {
 
 struct MeasurementState measurement_state;
 
-void update_state(uint16_t raw_humidity, uint16_t raw_temperature) {
-  float humidity = dht11_humidity(raw_humidity);
-  float temperature = dht11_temperature(raw_temperature);
-
+void update_state(float humidity, float temperature) {
   uint8_t day = (esp_timer_get_time() / ONE_DAY_US) % 7;
   if (day != measurement_state.current_day) {
     measurement_state.current_day = day;
@@ -149,43 +148,33 @@ enum Lcd1602QueueMessage {
   LCD1602_QUEUE_MESSAGE_TOGGLE_BACKLIGHT,
 };
 
+void lcd1602_write() {
+  esp_err_t ret =
+      ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_set_cursor(LCD1602_ROW_1, 0));
+  for (const char* p = lcd1602_header; ret == ESP_OK && *p; ++p) {
+    ret = ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_write_data(*p));
+  }
+
+  if (ret == ESP_OK) {
+    ret = ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_set_cursor(LCD1602_ROW_2, 0));
+  }
+
+  for (const char* p = lcd1602_value; ret == ESP_OK && *p; ++p) {
+    ret = ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_write_data(*p));
+  }
+}
+
 void lcd1602_task(void* params) {
   enum Lcd1602QueueMessage message;
   for (;;) {
     xQueueReceive(lcd1602_queue, &message, portMAX_DELAY);
-
-    bool update = false;
     switch (message) {
       case LCD1602_QUEUE_MESSAGE_UPDATE_DISPLAY:
-        update = true;
+        lcd1602_write();
         break;
       case LCD1602_QUEUE_MESSAGE_TOGGLE_BACKLIGHT:
         lcd1602_toggle_backlight();
         break;
-    }
-
-    if (update) {
-      if (ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_set_cursor(LCD1602_ROW_1, 0)) !=
-          ESP_OK) {
-        continue;
-      }
-
-      for (const char* p = lcd1602_header; *p; ++p) {
-        if (ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_write_data(*p)) != ESP_OK) {
-          continue;
-        }
-      }
-
-      if (ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_set_cursor(LCD1602_ROW_2, 0)) !=
-          ESP_OK) {
-        continue;
-      }
-
-      for (const char* p = lcd1602_value; *p; ++p) {
-        if (ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_write_data(*p)) != ESP_OK) {
-          continue;
-        }
-      }
     }
   }
 }
@@ -210,6 +199,7 @@ QueueHandle_t main_queue = NULL;
 enum MainQueueMessageType {
   MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT,
   MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE,
+  MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED,
 };
 
 struct MainQueueMessage {
@@ -217,6 +207,8 @@ struct MainQueueMessage {
   uint16_t raw_humidity;
   uint16_t raw_temperature;
 };
+
+bool lcd1602_backlight_on = true;
 
 void buttons_task(void* params) {
   uint8_t prev_button = 0;
@@ -231,15 +223,24 @@ void buttons_task(void* params) {
     if (prev_button != button) {
       prev_button = button;
       if (button == 1) {
-        enum Lcd1602QueueMessage message =
+        lcd1602_backlight_on = !lcd1602_backlight_on;
+        if (!lcd1602_backlight_on) {
+          struct MainQueueMessage main_queue_message = {
+              .type = MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED,
+          };
+
+          xQueueSendToBack(main_queue, &main_queue_message, portMAX_DELAY);
+        }
+
+        enum Lcd1602QueueMessage lcd1602_message =
             LCD1602_QUEUE_MESSAGE_TOGGLE_BACKLIGHT;
-        xQueueSendToBack(lcd1602_queue, &message, portMAX_DELAY);
+        xQueueSendToBack(lcd1602_queue, &lcd1602_message, portMAX_DELAY);
       } else if (button == 2) {
-        struct MainQueueMessage message = {
+        struct MainQueueMessage main_queue_message = {
             .type = MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE,
         };
 
-        xQueueSendToBack(main_queue, &message, portMAX_DELAY);
+        xQueueSendToBack(main_queue, &main_queue_message, portMAX_DELAY);
       }
     }
 
@@ -268,6 +269,18 @@ esp_err_t buttons_setup() {
   }
 
   return ESP_OK;
+}
+
+esp_err_t led_setup() {
+  gpio_config_t io_conf = {
+      .pin_bit_mask = 1ULL << LED_PIN,
+      .mode = GPIO_MODE_OUTPUT,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
+  };
+
+  return gpio_config(&io_conf);
 }
 
 void dht11_task(void* params) {
@@ -310,18 +323,29 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(lcd1602_setup());
   ESP_ERROR_CHECK(buttons_setup());
+  ESP_ERROR_CHECK(led_setup());
   ESP_ERROR_CHECK(main_setup());
 
   struct MainQueueMessage main_queue_message;
+  float humidity;
+  float temperature;
   for (;;) {
     xQueueReceive(main_queue, &main_queue_message, portMAX_DELAY);
     switch (main_queue_message.type) {
       case MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT:
-        update_state(main_queue_message.raw_humidity,
-                     main_queue_message.raw_temperature);
+        humidity = dht11_humidity(main_queue_message.raw_humidity);
+        temperature = dht11_temperature(main_queue_message.raw_temperature);
+        if (lcd1602_backlight_on && (humidity < 30 || humidity > 60)) {
+          gpio_set_level(LED_PIN, 1);
+        }
+
+        update_state(humidity, temperature);
         break;
       case MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE:
         lcd1602_page = lcd1602_page == 7 ? 0 : lcd1602_page + 1;
+        break;
+      case MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED:
+        gpio_set_level(LED_PIN, 0);
         break;
     }
 
