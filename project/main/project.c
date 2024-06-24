@@ -8,11 +8,16 @@
 #include "driver/gpio.h"
 #include "driver/i2c_types.h"  // IWYU pragma: keep.
 #include "esp_err.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"  // IWYU pragma: keep.
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "lcd1602.h"
+#include "nvs_flash.h"
 
 #define TAG "project"
 
@@ -200,12 +205,20 @@ enum MainQueueMessageType {
   MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT,
   MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE,
   MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED,
+  MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST,
+};
+
+struct MeasurementData {
+  uint16_t raw_humidity;
+  uint16_t raw_temperature;
 };
 
 struct MainQueueMessage {
   enum MainQueueMessageType type;
-  uint16_t raw_humidity;
-  uint16_t raw_temperature;
+  union {
+    struct MeasurementData measurement_data;
+    httpd_req_t* http_req;
+  } data;
 };
 
 bool lcd1602_backlight_on = true;
@@ -293,8 +306,14 @@ void dht11_task(void* params) {
             dht11_read(DHT11_PIN, &humidity, &temperature)) == ESP_OK) {
       struct MainQueueMessage message = {
           .type = MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT,
-          .raw_humidity = humidity,
-          .raw_temperature = temperature,
+          .data =
+              {
+                  .measurement_data =
+                      {
+                          .raw_humidity = humidity,
+                          .raw_temperature = temperature,
+                      },
+              },
       };
 
       xQueueSendToBack(main_queue, &message, portMAX_DELAY);
@@ -310,7 +329,7 @@ esp_err_t main_setup() {
     return ESP_ERR_NO_MEM;
   }
 
-  if (xTaskCreate(dht11_task, "DHT11", configMINIMAL_STACK_SIZE, NULL, 1,
+  if (xTaskCreate(dht11_task, "main", configMINIMAL_STACK_SIZE, NULL, 1,
                   NULL) != pdPASS) {
     return ESP_ERR_NO_MEM;
   }
@@ -318,23 +337,146 @@ esp_err_t main_setup() {
   return ESP_OK;
 }
 
+esp_err_t wifi_setup() {
+  esp_err_t ret;
+
+  if ((ret = esp_netif_init()) != ESP_OK) {
+    return ret;
+  }
+
+  if ((ret = esp_event_loop_create_default()) != ESP_OK) {
+    return ret;
+  }
+
+  esp_netif_create_default_wifi_ap();
+
+  wifi_init_config_t wifi_init_conf = WIFI_INIT_CONFIG_DEFAULT();
+  if ((ret = esp_wifi_init(&wifi_init_conf)) != ESP_OK) {
+    return ret;
+  }
+
+  if ((ret = esp_wifi_set_mode(WIFI_MODE_AP)) != ESP_OK) {
+    return ret;
+  }
+
+  wifi_config_t wifi_conf = {
+      .ap =
+          {
+              .ssid = "ESP32-WROVER",
+              .password = "",
+              .channel = 1,
+              .authmode = WIFI_AUTH_OPEN,
+              .max_connection = 2,
+              .pmf_cfg =
+                  {
+                      .required = true,
+                  },
+          },
+  };
+
+  if ((ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_conf)) != ESP_OK) {
+    return ret;
+  }
+
+  return esp_wifi_start();
+}
+
+httpd_handle_t http_server = NULL;
+
+esp_err_t http_server_handler(httpd_req_t* req) {
+  httpd_req_t* req_copy = NULL;
+  esp_err_t ret = httpd_req_async_handler_begin(req, &req_copy);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  struct MainQueueMessage message = {
+      .type = MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST,
+      .data =
+          {
+              .http_req = req_copy,
+          },
+  };
+
+  if (xQueueSendToBack(main_queue, &message, pdMS_TO_TICKS(1000)) == pdFALSE) {
+    httpd_resp_set_status(req, "503 Busy");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Looks like we're busy...");
+    httpd_req_async_handler_complete(req_copy);
+    return ESP_FAIL;
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t http_server_setup() {
+  httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
+  conf.max_open_sockets = 2;
+  conf.lru_purge_enable = true;
+
+  esp_err_t ret = httpd_start(&http_server, &conf);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  const httpd_uri_t uri = {
+      .uri = "/",
+      .method = HTTP_GET,
+      .handler = http_server_handler,
+  };
+
+  return httpd_register_uri_handler(http_server, &uri);
+}
+
+esp_err_t handle_http_req(httpd_req_t* req) {
+  esp_err_t ret;
+
+  if ((ret = httpd_resp_set_type(req, "text/plain")) != ESP_OK) {
+    return ret;
+  }
+
+  if ((ret = httpd_resp_sendstr(req, "Hello!?")) != ESP_OK) {
+    return ret;
+  }
+
+  return httpd_req_async_handler_complete(req);
+}
+
 void app_main(void) {
+  // N.B. This is required for Wi-Fi.
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+
+  ESP_ERROR_CHECK(ret);
+
   memset(&measurement_state, 0, sizeof(struct MeasurementState));
 
   ESP_ERROR_CHECK(lcd1602_setup());
   ESP_ERROR_CHECK(buttons_setup());
   ESP_ERROR_CHECK(led_setup());
   ESP_ERROR_CHECK(main_setup());
+  ESP_ERROR_CHECK(wifi_setup());
+  ESP_ERROR_CHECK(http_server_setup());
 
   struct MainQueueMessage main_queue_message;
+
   float humidity;
   float temperature;
   for (;;) {
     xQueueReceive(main_queue, &main_queue_message, portMAX_DELAY);
+
+    bool update_lcd = false;
     switch (main_queue_message.type) {
       case MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT:
-        humidity = dht11_humidity(main_queue_message.raw_humidity);
-        temperature = dht11_temperature(main_queue_message.raw_temperature);
+        update_lcd = true;
+        humidity = dht11_humidity(
+            main_queue_message.data.measurement_data.raw_humidity);
+        temperature = dht11_temperature(
+            main_queue_message.data.measurement_data.raw_temperature);
         if (lcd1602_backlight_on && (humidity < 30 || humidity > 60)) {
           gpio_set_level(LED_PIN, 1);
         }
@@ -342,16 +484,23 @@ void app_main(void) {
         update_state(humidity, temperature);
         break;
       case MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE:
+        update_lcd = true;
         lcd1602_page = lcd1602_page == 7 ? 0 : lcd1602_page + 1;
         break;
       case MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED:
         gpio_set_level(LED_PIN, 0);
         break;
+      case MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST:
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            handle_http_req(main_queue_message.data.http_req));
+        break;
     }
 
-    lcd1602_format_rows();
-    enum Lcd1602QueueMessage lcd1602_queue_message =
-        LCD1602_QUEUE_MESSAGE_UPDATE_DISPLAY;
-    xQueueSendToBack(lcd1602_queue, &lcd1602_queue_message, portMAX_DELAY);
+    if (update_lcd) {
+      lcd1602_format_rows();
+      enum Lcd1602QueueMessage lcd1602_queue_message =
+          LCD1602_QUEUE_MESSAGE_UPDATE_DISPLAY;
+      xQueueSendToBack(lcd1602_queue, &lcd1602_queue_message, portMAX_DELAY);
+    }
   }
 }
