@@ -1,9 +1,12 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "driver/i2c_master.h"  // IWYU pragma: keep.
 #include "esp_err.h"
+
+extern bool lcd1602_backlight_on;
 
 esp_err_t lcd1602_init(i2c_port_num_t port, gpio_num_t sda_pin,
                        gpio_num_t scl_pin, uint8_t address);

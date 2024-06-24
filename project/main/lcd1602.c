@@ -20,10 +20,10 @@
 i2c_master_bus_handle_t lcd1602_bus_handle = NULL;
 i2c_master_dev_handle_t lcd1602_dev_handle = NULL;
 
-bool backlight_on = true;
+bool lcd1602_backlight_on = true;
 
 static esp_err_t lcd1602_i2c_write(uint8_t value) {
-  if (backlight_on) {
+  if (lcd1602_backlight_on) {
     value |= LCD1602_BACKLIGHT;
   }
 
@@ -151,7 +151,7 @@ esp_err_t lcd1602_set_cursor(enum Lcd1602Row row, uint8_t col) {
 }
 
 esp_err_t lcd1602_toggle_backlight() {
-  backlight_on = !backlight_on;
+  lcd1602_backlight_on = !lcd1602_backlight_on;
   return lcd1602_i2c_write(0);
 }
 

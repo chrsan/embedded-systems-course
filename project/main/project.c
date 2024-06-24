@@ -9,17 +9,16 @@
 #include "driver/i2c_types.h"  // IWYU pragma: keep.
 #include "esp_err.h"
 #include "esp_event.h"
-#include "esp_http_server.h"
 #include "esp_netif.h"
-#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"  // IWYU pragma: keep.
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "http.h"
 #include "lcd1602.h"
+#include "measurement.h"
+#include "message.h"
 #include "nvs_flash.h"
-
-#define TAG "project"
 
 #define LCD1602_ADDRESS 0x27
 #define LCD1602_I2C_PORT I2C_NUM_0
@@ -37,65 +36,7 @@
 
 #define QUEUE_LENGTH 8
 
-#define ONE_DAY_US INT64_C(86400000000)
-
-struct Measurement {
-  float last_value;
-
-  float avg;
-  float min;
-  float max;
-};
-
-void update_measurement(struct Measurement* measurement, uint32_t count,
-                        float value) {
-  measurement->last_value = value;
-  if (count == 1) {
-    measurement->avg = value;
-  } else {
-    measurement->avg += (value - measurement->avg) / count;
-  }
-
-  if (value < measurement->min || count == 1) {
-    measurement->min = value;
-  }
-
-  if (value > measurement->max) {
-    measurement->max = value;
-  }
-}
-
-struct MeasurementState {
-  uint8_t current_day;
-  uint32_t current_measurement_count;
-  uint64_t total_measurement_count;
-  struct Measurement humidity[8];
-  struct Measurement temperature[8];
-};
-
 struct MeasurementState measurement_state;
-
-void update_state(float humidity, float temperature) {
-  uint8_t day = (esp_timer_get_time() / ONE_DAY_US) % 7;
-  if (day != measurement_state.current_day) {
-    measurement_state.current_day = day;
-
-    memset(&measurement_state.humidity[day], 0, sizeof(struct Measurement));
-    memset(&measurement_state.temperature[day], 0, sizeof(struct Measurement));
-  }
-
-  measurement_state.current_measurement_count += 1;
-  update_measurement(&measurement_state.humidity[day],
-                     measurement_state.current_measurement_count, humidity);
-  update_measurement(&measurement_state.temperature[day],
-                     measurement_state.current_measurement_count, temperature);
-
-  measurement_state.total_measurement_count += 1;
-  update_measurement(&measurement_state.humidity[7],
-                     measurement_state.total_measurement_count, humidity);
-  update_measurement(&measurement_state.temperature[7],
-                     measurement_state.total_measurement_count, temperature);
-}
 
 char lcd1602_header[LCD1602_BUFFER_SIZE + 1];
 char lcd1602_value[LCD1602_BUFFER_SIZE + 1];
@@ -148,11 +89,6 @@ void lcd1602_format_rows() {
 
 QueueHandle_t lcd1602_queue = NULL;
 
-enum Lcd1602QueueMessage {
-  LCD1602_QUEUE_MESSAGE_UPDATE_DISPLAY,
-  LCD1602_QUEUE_MESSAGE_TOGGLE_BACKLIGHT,
-};
-
 void lcd1602_write() {
   esp_err_t ret =
       ESP_ERROR_CHECK_WITHOUT_ABORT(lcd1602_set_cursor(LCD1602_ROW_1, 0));
@@ -201,28 +137,6 @@ esp_err_t lcd1602_setup() {
 
 QueueHandle_t main_queue = NULL;
 
-enum MainQueueMessageType {
-  MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT,
-  MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE,
-  MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED,
-  MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST,
-};
-
-struct MeasurementData {
-  uint16_t raw_humidity;
-  uint16_t raw_temperature;
-};
-
-struct MainQueueMessage {
-  enum MainQueueMessageType type;
-  union {
-    struct MeasurementData measurement_data;
-    httpd_req_t* http_req;
-  } data;
-};
-
-bool lcd1602_backlight_on = true;
-
 void buttons_task(void* params) {
   uint8_t prev_button = 0;
   for (;;) {
@@ -236,8 +150,7 @@ void buttons_task(void* params) {
     if (prev_button != button) {
       prev_button = button;
       if (button == 1) {
-        lcd1602_backlight_on = !lcd1602_backlight_on;
-        if (!lcd1602_backlight_on) {
+        if (lcd1602_backlight_on) {
           struct MainQueueMessage main_queue_message = {
               .type = MAIN_QUEUE_MESSAGE_TYPE_TURN_OFF_LED,
           };
@@ -349,7 +262,6 @@ esp_err_t wifi_setup() {
   }
 
   esp_netif_create_default_wifi_ap();
-
   wifi_init_config_t wifi_init_conf = WIFI_INIT_CONFIG_DEFAULT();
   if ((ret = esp_wifi_init(&wifi_init_conf)) != ESP_OK) {
     return ret;
@@ -381,67 +293,6 @@ esp_err_t wifi_setup() {
   return esp_wifi_start();
 }
 
-httpd_handle_t http_server = NULL;
-
-esp_err_t http_server_handler(httpd_req_t* req) {
-  httpd_req_t* req_copy = NULL;
-  esp_err_t ret = httpd_req_async_handler_begin(req, &req_copy);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-
-  struct MainQueueMessage message = {
-      .type = MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST,
-      .data =
-          {
-              .http_req = req_copy,
-          },
-  };
-
-  if (xQueueSendToBack(main_queue, &message, pdMS_TO_TICKS(1000)) == pdFALSE) {
-    httpd_resp_set_status(req, "503 Busy");
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_sendstr(req, "Looks like we're busy...");
-    httpd_req_async_handler_complete(req_copy);
-    return ESP_FAIL;
-  }
-
-  return ESP_OK;
-}
-
-esp_err_t http_server_setup() {
-  httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
-  conf.max_open_sockets = 2;
-  conf.lru_purge_enable = true;
-
-  esp_err_t ret = httpd_start(&http_server, &conf);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-
-  const httpd_uri_t uri = {
-      .uri = "/",
-      .method = HTTP_GET,
-      .handler = http_server_handler,
-  };
-
-  return httpd_register_uri_handler(http_server, &uri);
-}
-
-esp_err_t handle_http_req(httpd_req_t* req) {
-  esp_err_t ret;
-
-  if ((ret = httpd_resp_set_type(req, "text/plain")) != ESP_OK) {
-    return ret;
-  }
-
-  if ((ret = httpd_resp_sendstr(req, "Hello!?")) != ESP_OK) {
-    return ret;
-  }
-
-  return httpd_req_async_handler_complete(req);
-}
-
 void app_main(void) {
   // N.B. This is required for Wi-Fi.
   esp_err_t ret = nvs_flash_init();
@@ -460,7 +311,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(led_setup());
   ESP_ERROR_CHECK(main_setup());
   ESP_ERROR_CHECK(wifi_setup());
-  ESP_ERROR_CHECK(http_server_setup());
+  ESP_ERROR_CHECK(http_server_setup(main_queue));
 
   struct MainQueueMessage main_queue_message;
 
@@ -481,7 +332,7 @@ void app_main(void) {
           gpio_set_level(LED_PIN, 1);
         }
 
-        update_state(humidity, temperature);
+        measurement_state_update(&measurement_state, humidity, temperature);
         break;
       case MAIN_QUEUE_MESSAGE_TYPE_TOGGLE_PAGE:
         update_lcd = true;
@@ -491,8 +342,8 @@ void app_main(void) {
         gpio_set_level(LED_PIN, 0);
         break;
       case MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST:
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            handle_http_req(main_queue_message.data.http_req));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(http_handle_req(
+            main_queue_message.data.http_req, &measurement_state));
         break;
     }
 
