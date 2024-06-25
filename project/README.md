@@ -117,11 +117,13 @@ Default konfiguration för ESP32 och FreeRTOS har en tick rate 100Hz vilket gör
 delays kortare än 10ms kan bli allt mellan 0ms och 10ms (se [här][2]).
 
 ```python
+# Python
+
 assert(int((5 * 100) / 1000)) == 0
 ```
 
-Detta gör det omöjligt vad gäller timing för vissa sensorer. P.g.a. detta så har jag
-i vissa fall då det krävs använt en spinning delay.
+Detta gör det omöjligt vad gäller timing för vissa sensorer. P.g.a. detta så har
+jag i vissa fall då det krävs använt en spinning delay.
 
 ```c
 #define NOP() asm volatile("nop")
