@@ -24,13 +24,14 @@
 #define LCD1602_I2C_PORT I2C_NUM_0
 #define LCD1602_SDA_PIN GPIO_NUM_13
 #define LCD1602_SCL_PIN GPIO_NUM_14
-#define LCD1602_TOGGLE_BACKLIGHT_BUTTON_PIN GPIO_NUM_32
+#define LCD1602_TOGGLE_LIGHT_BUTTON_PIN GPIO_NUM_32
 #define LCD1602_TOGGLE_PAGE_BUTTON_PIN GPIO_NUM_33
 
 #define LCD1602_BUFFER_SIZE 16
 
 #define DHT11_PIN GPIO_NUM_4
 #define DHT11_SENSOR_READ_INTERVAL_MS 4000
+// #define DHT11_SENSOR_READ_INTERVAL_MS 1000 * 60
 
 #define LED_PIN GPIO_NUM_15
 
@@ -141,7 +142,7 @@ void buttons_task(void* params) {
   uint8_t prev_button = 0;
   for (;;) {
     uint8_t button = 0;
-    if (gpio_get_level(LCD1602_TOGGLE_BACKLIGHT_BUTTON_PIN) == 0) {
+    if (gpio_get_level(LCD1602_TOGGLE_LIGHT_BUTTON_PIN) == 0) {
       button = 1;
     } else if (gpio_get_level(LCD1602_TOGGLE_PAGE_BUTTON_PIN) == 0) {
       button = 2;
@@ -176,7 +177,7 @@ void buttons_task(void* params) {
 
 esp_err_t buttons_setup() {
   gpio_config_t io_conf = {
-      .pin_bit_mask = (1ULL << LCD1602_TOGGLE_BACKLIGHT_BUTTON_PIN) |
+      .pin_bit_mask = (1ULL << LCD1602_TOGGLE_LIGHT_BUTTON_PIN) |
                       (1ULL << LCD1602_TOGGLE_PAGE_BUTTON_PIN),
       .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_ENABLE,
@@ -219,9 +220,9 @@ void dht11_task(void* params) {
             dht11_read(DHT11_PIN, &humidity, &temperature)) == ESP_OK) {
       struct MainQueueMessage message = {
           .type = MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT,
-          .data =
+          .u =
               {
-                  .measurement_data =
+                  .measurement =
                       {
                           .raw_humidity = humidity,
                           .raw_temperature = temperature,
@@ -324,10 +325,10 @@ void app_main(void) {
     switch (main_queue_message.type) {
       case MAIN_QUEUE_MESSAGE_TYPE_MEASUREMENT:
         update_lcd = true;
-        humidity = dht11_humidity(
-            main_queue_message.data.measurement_data.raw_humidity);
-        temperature = dht11_temperature(
-            main_queue_message.data.measurement_data.raw_temperature);
+        humidity =
+            dht11_humidity(main_queue_message.u.measurement.raw_humidity);
+        temperature =
+            dht11_temperature(main_queue_message.u.measurement.raw_temperature);
         if (lcd1602_backlight_on && (humidity < 30 || humidity > 60)) {
           gpio_set_level(LED_PIN, 1);
         }
@@ -342,8 +343,8 @@ void app_main(void) {
         gpio_set_level(LED_PIN, 0);
         break;
       case MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST:
-        ESP_ERROR_CHECK_WITHOUT_ABORT(http_handle_req(
-            main_queue_message.data.http_req, &measurement_state));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            http_handle_req(main_queue_message.u.http_req, &measurement_state));
         break;
     }
 

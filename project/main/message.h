@@ -16,15 +16,13 @@ enum MainQueueMessageType {
   MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST,
 };
 
-struct MeasurementData {
-  uint16_t raw_humidity;
-  uint16_t raw_temperature;
-};
-
 struct MainQueueMessage {
   enum MainQueueMessageType type;
   union {
-    struct MeasurementData measurement_data;
+    struct {
+      uint16_t raw_humidity;
+      uint16_t raw_temperature;
+    } measurement;
     httpd_req_t* http_req;
-  } data;
+  } u;
 };

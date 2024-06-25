@@ -17,7 +17,7 @@ static esp_err_t http_server_handler(httpd_req_t* req) {
 
   struct MainQueueMessage message = {
       .type = MAIN_QUEUE_MESSAGE_TYPE_HTTP_REQUEST,
-      .data =
+      .u =
           {
               .http_req = req_copy,
           },
